@@ -40,7 +40,7 @@ def webhook():
     order = {
         "type": "market",
         "side": "buy",
-        "product_id": "BTC-USD",
+        "product_id": "BTC-USDC",
         "funds": "50"
     }
 
