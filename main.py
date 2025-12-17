@@ -37,18 +37,23 @@ def send_telegram(message):
 # ───────────────────────────────
 # COINBASE AUTH
 # ───────────────────────────────
+import base64
+
 def coinbase_headers(method, request_path, body=""):
     timestamp = str(time.time())
     message = timestamp + method + request_path + body
+
+    secret_decoded = base64.b64decode(COINBASE_API_SECRET)
+
     signature = hmac.new(
-        COINBASE_API_SECRET.encode(),
+        secret_decoded,
         message.encode(),
         hashlib.sha256
     ).digest()
 
     return {
         "CB-ACCESS-KEY": COINBASE_API_KEY,
-        "CB-ACCESS-SIGN": signature.hex(),
+        "CB-ACCESS-SIGN": base64.b64encode(signature).decode(),
         "CB-ACCESS-TIMESTAMP": timestamp,
         "CB-ACCESS-PASSPHRASE": COINBASE_API_PASSPHRASE,
         "Content-Type": "application/json"
