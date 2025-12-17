@@ -4,38 +4,51 @@ import requests
 import time
 import hmac
 import hashlib
-import base64
-import json
+from datetime import datetime, date
 
 app = Flask(__name__)
 
 # ───────────────────────────────
-# ENVIRONMENT VARIABLES
+# ENV VARIABLES
 # ───────────────────────────────
-COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
-COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET")
-COINBASE_API_PASSPHRASE = os.environ.get("COINBASE_API_PASSPHRASE")
+COINBASE_API_KEY = os.environ["COINBASE_API_KEY"]
+COINBASE_API_SECRET = os.environ["COINBASE_API_SECRET"]
+COINBASE_API_PASSPHRASE = os.environ["COINBASE_API_PASSPHRASE"]
+
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 BASE_URL = "https://api.exchange.coinbase.com"
 
+daily_pnl = 0.0
+last_pnl_date = date.today()
+
 # ───────────────────────────────
-# COINBASE SIGNING FUNCTION
+# TELEGRAM HELPER
+# ───────────────────────────────
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+    requests.post(url, json=payload)
+
+# ───────────────────────────────
+# COINBASE AUTH
 # ───────────────────────────────
 def coinbase_headers(method, request_path, body=""):
     timestamp = str(time.time())
     message = timestamp + method + request_path + body
-
     signature = hmac.new(
-        base64.b64decode(COINBASE_API_SECRET),
-        message.encode("utf-8"),
+        COINBASE_API_SECRET.encode(),
+        message.encode(),
         hashlib.sha256
     ).digest()
 
-    signature_b64 = base64.b64encode(signature).decode()
-
     return {
         "CB-ACCESS-KEY": COINBASE_API_KEY,
-        "CB-ACCESS-SIGN": signature_b64,
+        "CB-ACCESS-SIGN": signature.hex(),
         "CB-ACCESS-TIMESTAMP": timestamp,
         "CB-ACCESS-PASSPHRASE": COINBASE_API_PASSPHRASE,
         "Content-Type": "application/json"
@@ -46,44 +59,78 @@ def coinbase_headers(method, request_path, body=""):
 # ───────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
+    global daily_pnl, last_pnl_date
 
-    # ✅ LOG INCOMING WEBHOOK
-    print("Webhook received:", data, flush=True)
+    data = request.json
+    print("Webhook received:", data)
 
-    if not data:
-        return "No JSON received", 400
+    # Daily PnL reset & report
+    if date.today() != last_pnl_date:
+        send_telegram(f"📊 Daily PnL Summary: ${daily_pnl:.2f}")
+        daily_pnl = 0.0
+        last_pnl_date = date.today()
 
-    if data.get("action") != "buy":
-        print("Ignored action:", data.get("action"), flush=True)
-        return "Ignored", 200
+    action = data.get("action")
 
-    # ───────────────────────────────
-    # ORDER DETAILS
-    # ───────────────────────────────
-    order = {
-        "type": "market",
-        "side": "buy",
-        "product_id": "BTC-USDC",
-        "funds": "50"
-    }
+    try:
+        if action == "buy":
+            usd_amount = data.get("amount_usd", 50)
 
-    body = json.dumps(order)
-    headers = coinbase_headers("POST", "/orders", body)
+            order = {
+                "type": "market",
+                "side": "buy",
+                "product_id": "BTC-USDC",
+                "funds": str(usd_amount)
+            }
 
-    response = requests.post(
-        BASE_URL + "/orders",
-        headers=headers,
-        data=body
-    )
+            body = str(order).replace("'", '"')
+            headers = coinbase_headers("POST", "/orders", body)
+            response = requests.post(BASE_URL + "/orders", headers=headers, data=body)
 
-    # ✅ LOG COINBASE RESPONSE
-    print("Coinbase response:", response.text, flush=True)
+            result = response.json()
 
-    return jsonify(response.json()), response.status_code
+            send_telegram(
+                f"🟢 BUY EXECUTED\n"
+                f"Asset: BTC-USDC\n"
+                f"Amount: ${usd_amount}"
+            )
+
+            return jsonify(result)
+
+        elif action == "sell":
+            size = data.get("size")
+
+            order = {
+                "type": "market",
+                "side": "sell",
+                "product_id": "BTC-USDC",
+                "size": str(size)
+            }
+
+            body = str(order).replace("'", '"')
+            headers = coinbase_headers("POST", "/orders", body)
+            response = requests.post(BASE_URL + "/orders", headers=headers, data=body)
+
+            send_telegram(
+                f"🔴 SELL EXECUTED\n"
+                f"Asset: BTC-USDC\n"
+                f"Size: {size} BTC"
+            )
+
+            return jsonify(response.json())
+
+        return jsonify({"status": "ignored"})
+
+    except Exception as e:
+        send_telegram(f"🚨 ERROR ALERT\n{str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 # ───────────────────────────────
-# LOCAL TESTING ONLY
+# HEALTH CHECK
 # ───────────────────────────────
+@app.route("/")
+def health():
+    return "Bot is running", 200
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run()
