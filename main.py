@@ -3,7 +3,7 @@ import json
 import time
 import requests
 import jwt
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -13,6 +13,9 @@ app = Flask(__name__)
 COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
 COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")
 
+if not COINBASE_API_KEY or not COINBASE_PRIVATE_KEY:
+    raise RuntimeError("Missing Coinbase API environment variables")
+
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
 DEFAULT_USD_AMOUNT = 50
@@ -20,38 +23,38 @@ DEFAULT_USD_AMOUNT = 50
 # ─────────────────────────────────────────
 # CREATE JWT (Coinbase Advanced Trade)
 # ─────────────────────────────────────────
+
 def create_jwt():
     payload = {
         "sub": COINBASE_API_KEY,
         "iss": "coinbase-cloud",
         "nbf": int(time.time()),
         "exp": int(time.time()) + 120,
-        "aud": ["coinbase-cloud"]
+        "aud": ["coinbase-cloud"],
     }
 
     headers = {
         "kid": COINBASE_API_KEY,
-        "nonce": str(int(time.time() * 1000))
+        "nonce": str(int(time.time() * 1000)),
     }
 
-    token = jwt.encode(
+    return jwt.encode(
         payload,
         COINBASE_PRIVATE_KEY,
         algorithm="ES256",
-        headers=headers
+        headers=headers,
     )
-
-    return token
 
 # ─────────────────────────────────────────
 # PLACE MARKET ORDER
 # ─────────────────────────────────────────
-def place_market_order(side, usd_amount=None):
+
+def place_market_order(side: str, usd_amount: float | None = None):
     jwt_token = create_jwt()
 
     headers = {
         "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     order = {
@@ -60,10 +63,10 @@ def place_market_order(side, usd_amount=None):
         "side": side.upper(),
         "order_configuration": {
             "market_market_ioc": {}
-        }
+        },
     }
 
-    if side == "buy":
+    if side.lower() == "buy":
         order["order_configuration"]["market_market_ioc"]["quote_size"] = str(
             usd_amount or DEFAULT_USD_AMOUNT
         )
@@ -71,33 +74,59 @@ def place_market_order(side, usd_amount=None):
     response = requests.post(
         f"{COINBASE_API_URL}/api/v3/brokerage/orders",
         headers=headers,
-        json=order
+        json=order,
+        timeout=10,
     )
 
     print("Coinbase response:", response.status_code, response.text)
-    return response.text
+    return response.status_code, response.text
 
 # ─────────────────────────────────────────
-# WEBHOOK ENDPOINT
+# WEBHOOK ENDPOINT (TradingView)
 # ─────────────────────────────────────────
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # Ensure TradingView sends raw JSON
+    if not request.data:
+        return jsonify(error="Empty request body"), 400
+
     try:
         data = request.get_json(force=True)
-    except Exception as e:
-        return {"error": "Invalid JSON"}, 400
+    except Exception:
+        return jsonify(error="Invalid JSON"), 400
 
     action = data.get("action")
     symbol = data.get("symbol")
+    usd_amount = data.get("usd_amount")
 
-    if not action or not symbol:
-        return {"error": "Missing fields"}, 400
+    if action not in {"buy", "sell"}:
+        return jsonify(error="Invalid or missing action"), 400
 
-    # proceed to Coinbase order logic
-    return {"status": "ok"}, 200
+    if symbol != PRODUCT_ID:
+        return jsonify(error="Invalid symbol"), 400
+
+    if action == "buy":
+        status, resp = place_market_order("buy", usd_amount)
+    else:
+        status, resp = place_market_order("sell")
+
+    if status >= 300:
+        return jsonify(error="Coinbase order failed", details=resp), 400
+
+    return jsonify(status="order placed", action=action), 200
+
+# ─────────────────────────────────────────
+# HEALTH CHECK (OPTIONAL)
+# ─────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
 
 # ─────────────────────────────────────────
 # START SERVER
 # ─────────────────────────────────────────
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
