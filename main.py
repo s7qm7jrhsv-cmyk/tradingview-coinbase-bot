@@ -159,6 +159,37 @@ def place_market_order(side: str, usd_amount: Optional[float] = None, base_size:
     except Exception:
         return resp.status_code, {"raw": resp.text}
 
+# --- Order details & fills helpers (add below your REST helpers) ---
+ORDER_DETAILS_PATH_TMPL = "/api/v3/brokerage/orders/historical/{order_id}"
+FILLS_PATH = "/api/v3/brokerage/orders/historical/fills"
+
+def fetch_order_details(order_id: str):
+    """
+    Fetch a single order's details by order_id.
+    Returns: (status_code, json_or_text)
+    """
+    path = ORDER_DETAILS_PATH_TMPL.format(order_id=order_id)
+    headers = auth_headers("GET", path)
+    resp = requests.get(f"{COINBASE_API_URL}{path}", headers=headers, timeout=10)
+    print("Order details:", resp.status_code, resp.text)
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
+
+def fetch_fills(product_id: str = "BTC-USDC", limit: int = 50):
+    """
+    Fetch recent fills for a product to see base size, price, and fees.
+    Returns: (status_code, json_or_text)
+    """
+    headers = auth_headers("GET", FILLS_PATH)
+    params = {"product_id": product_id, "limit": str(limit)}
+    resp = requests.get(f"{COINBASE_API_URL}{FILLS_PATH}", headers=headers, params=params, timeout=10)
+    print("Order fills:", resp.status_code, resp.text)
+       try:
+        return resp.status_code, resp.json()
+    except Exception:
+
 # ─────────────────────────────────────────
 # Webhook endpoint
 # ─────────────────────────────────────────
