@@ -13,8 +13,10 @@ app = Flask(__name__)
 COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
 COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")
 
-if not COINBASE_API_KEY or not COINBASE_PRIVATE_KEY:
-    raise RuntimeError("Missing Coinbase API environment variables")
+# NOTE: Do NOT crash the container at startup if env vars are missing.
+# Railway may start the service before vars are attached or during redeploys.
+# We validate env vars at request time instead.
+pass
 
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
