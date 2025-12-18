@@ -1,80 +1,90 @@
 import os
 import json
 import time
-import hmac
-import hashlib
 import requests
+import jwt
 from flask import Flask, request
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────
-# ENVIRONMENT VARIABLES (Railway)
+# ENV VARIABLES (Railway)
 # ─────────────────────────────────────────
 COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
-COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET")
+COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")
 
-COINBASE_API_URL = "https://api.exchange.coinbase.com"
-
-PRODUCT_ID = "BTC-USDC"   # ✅ correct for BTC-USDC
-USD_AMOUNT = 50           # fallback amount if not provided
-
-# ─────────────────────────────────────────
-# COINBASE SIGNATURE
-# ─────────────────────────────────────────
-def sign_request(timestamp, method, request_path, body=""):
-    message = f"{timestamp}{method}{request_path}{body}"
-    hmac_key = base64.b64decode(COINBASE_API_SECRET)
-    signature = hmac.new(hmac_key, message.encode(), hashlib.sha256)
-    return base64.b64encode(signature.digest()).decode()
+COINBASE_API_URL = "https://api.coinbase.com"
+PRODUCT_ID = "BTC-USDC"
+DEFAULT_USD_AMOUNT = 50
 
 # ─────────────────────────────────────────
-# PLACE ORDER
+# CREATE JWT (Coinbase Advanced Trade)
 # ─────────────────────────────────────────
-def place_market_order(side, usd_amount=None):
-    timestamp = str(time.time())
-    request_path = "/orders"
-
-    order = {
-        "type": "market",
-        "side": side,
-        "product_id": PRODUCT_ID
+def create_jwt():
+    payload = {
+        "sub": COINBASE_API_KEY,
+        "iss": "coinbase-cloud",
+        "nbf": int(time.time()),
+        "exp": int(time.time()) + 120,
+        "aud": ["coinbase-cloud"]
     }
 
-    if side == "buy":
-        order["funds"] = str(usd_amount or USD_AMOUNT)
-    else:
-        order["size"] = "all"
+    headers = {
+        "kid": COINBASE_API_KEY,
+        "nonce": str(int(time.time() * 1000))
+    }
 
-    body = json.dumps(order)
-    signature = sign_request(timestamp, "POST", request_path, body)
+    token = jwt.encode(
+        payload,
+        COINBASE_PRIVATE_KEY,
+        algorithm="ES256",
+        headers=headers
+    )
+
+    return token
+
+# ─────────────────────────────────────────
+# PLACE MARKET ORDER
+# ─────────────────────────────────────────
+def place_market_order(side, usd_amount=None):
+    jwt_token = create_jwt()
 
     headers = {
-        "CB-ACCESS-KEY": COINBASE_API_KEY,
-        "CB-ACCESS-SIGN": signature,
-        "CB-ACCESS-TIMESTAMP": timestamp,
+        "Authorization": f"Bearer {jwt_token}",
         "Content-Type": "application/json"
     }
 
+    order = {
+        "client_order_id": str(int(time.time() * 1000)),
+        "product_id": PRODUCT_ID,
+        "side": side.upper(),
+        "order_configuration": {
+            "market_market_ioc": {}
+        }
+    }
+
+    if side == "buy":
+        order["order_configuration"]["market_market_ioc"]["quote_size"] = str(
+            usd_amount or DEFAULT_USD_AMOUNT
+        )
+
     response = requests.post(
-        COINBASE_API_URL + request_path,
+        f"{COINBASE_API_URL}/api/v3/brokerage/orders",
         headers=headers,
-        data=body
+        json=order
     )
 
     print("Coinbase response:", response.status_code, response.text)
     return response.text
 
 # ─────────────────────────────────────────
-# WEBHOOK ROUTE (FIXED)
+# WEBHOOK ENDPOINT
 # ─────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        raw_data = request.data.decode("utf-8")
-        print("Raw webhook received:", raw_data)
-
-        data = json.loads(raw_data)
+        data = request.get_json(force=True)
+        print("Webhook received:", data)
 
         action = data.get("action")
         symbol = data.get("symbol")
@@ -86,17 +96,15 @@ def webhook():
 
         if action == "buy":
             place_market_order("buy", usd_amount)
-        elif action == "sell":
-            place_market_order("sell")
 
         return "OK", 200
 
     except Exception as e:
         print("Webhook error:", str(e))
-        return "Error", 200   # IMPORTANT: always return 200 to TradingView
+        return "Error", 200
 
 # ─────────────────────────────────────────
-# START SERVER (Railway compatible)
+# START SERVER
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
