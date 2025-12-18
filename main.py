@@ -3,6 +3,7 @@ import json
 import time
 import requests
 import jwt
+import traceback
 from typing import Optional
 from flask import Flask, request, jsonify
 
@@ -12,7 +13,7 @@ app = Flask(__name__)
 # ENV VARIABLES (Railway)
 # ─────────────────────────────────────────
 COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
-COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")  # PEM for ES256
+COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")  # ES256 PEM
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
 DEFAULT_USD_AMOUNT = 50  # used only if buy amount isn't provided
@@ -45,7 +46,13 @@ def create_jwt() -> str:
         "kid": COINBASE_API_KEY,
         "nonce": str(int(time.time() * 1000)),
     }
-    return jwt.encode(payload, COINBASE_PRIVATE_KEY, algorithm="ES256", headers=headers)
+    try:
+        return jwt.encode(payload, COINBASE_PRIVATE_KEY, algorithm="ES256", headers=headers)
+    except Exception as e:
+        print("ERROR: JWT encode failed:", repr(e))
+        print("TRACEBACK:", traceback.format_exc())
+        raise
+
 
 def auth_headers() -> dict:
     token = create_jwt()
@@ -64,20 +71,30 @@ def fetch_accounts():
         headers=headers,
         timeout=10,
     )
-    return resp.status_code, resp.json()
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
 
 
 def get_available_btc() -> Optional[str]:
     status, data = fetch_accounts()
     if status >= 300:
         raise RuntimeError(f"Failed to fetch accounts: {data}")
-    # Find BTC account and return available balance as string
-    for acct in data.get("accounts", []):
+
+    accounts = data.get("accounts") or []
+    for acct in accounts:
+        # Some payloads use "currency" key for symbol
         if acct.get("currency") == "BTC":
+            # available_balance: {"value":"...","currency":"BTC"}
             ab = acct.get("available_balance") or {}
             val = ab.get("value")
-            if val and float(val) > 0:
-                return val  # Coinbase expects base_size as string
+            if val is not None:
+                try:
+                    if float(val) > 0:
+                        return str(val)
+                except Exception:
+                    pass
             return None
     return None
 
@@ -105,52 +122,77 @@ def place_market_order(side: str, usd_amount: Optional[float] = None, base_size:
             raise ValueError("SELL requires base_size (BTC amount).")
         order["order_configuration"]["market_market_ioc"]["base_size"] = str(base_size)
 
-    response = requests.post(
+    resp = requests.post(
         f"{COINBASE_API_URL}/api/v3/brokerage/orders",
         headers=headers,
         json=order,
         timeout=10,
     )
-    print("Coinbase response:", response.status_code, response.text)
+    print("Coinbase response:", resp.status_code, resp.text)
     try:
-        return response.status_code, response.json()
+        return resp.status_code, resp.json()
     except Exception:
-        return response.status_code, {"raw": response.text}
+        return resp.status_code, {"raw": resp.text}
 
 # ─────────────────────────────────────────
 # WEBHOOK ENDPOINT (TradingView)
 # ─────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    raw_body = request.data.decode("utf-8")
+    raw_body = request.data.decode("utf-8", errors="ignore")
     print("RAW WEBHOOK BODY:", raw_body)
 
+    # Try JSON first
+    data = None
     try:
         data = json.loads(raw_body)
     except Exception:
-        return jsonify(error="Body is not valid JSON"), 400
+        # Fallback: parse simple plain-text commands like "BUY BTCUSDC" or "SELL BTC-USDC"
+        text = raw_body.strip()
+        upper = text.upper()
+        if upper.startswith("BUY"):
+            data = {"action": "buy"}
+        elif upper.startswith("SELL"):
+            data = {"action": "sell"}
+        else:
+            return jsonify(error="Body is not valid JSON and no BUY/SELL keyword found"), 400
+        # Attempt to extract symbol token
+        tokens = upper.split()
+        sym = None
+        for tok in tokens:
+            if tok in {"BTCUSDC", "BTC-USDC"}:
+                sym = tok
+                break
+        data["symbol"] = sym or PRODUCT_ID
 
     # Validate env per request
     try:
         require_env()
     except RuntimeError as e:
+        print("ERROR: Env validation failed:", str(e))
         return jsonify(error=str(e)), 500
 
-    action = (data.get("action") or "").lower()
-    symbol = data.get("symbol")
+    action = (data.get("action") or "").strip().lower()
+    symbol = (data.get("symbol") or "").strip().upper()
+
+    # Normalize symbol (accept missing hyphen)
+    if symbol == "BTCUSDC":
+        symbol = "BTC-USDC"
 
     if action not in {"buy", "sell"}:
-        return jsonify(error="Invalid or missing action"), 400
+        return jsonify(error="Invalid or missing action",
+                       hint="Use {'action':'buy'|'sell','symbol':'BTC-USDC'}"), 400
 
-    # Symbol guard (must match our configured product)
     if symbol != PRODUCT_ID:
-        return jsonify(error=f"Unsupported symbol '{symbol}', expected '{PRODUCT_ID}'"), 400
+        return jsonify(error=f"Unsupported symbol '{symbol}'", expected=PRODUCT_ID), 400
 
     try:
         if action == "buy":
-            # Railway controls the amount; use DEFAULT if none provided
             usd_amount = data.get("usd_amount")
-            usd_amount = float(usd_amount) if usd_amount is not None else DEFAULT_USD_AMOUNT
+            try:
+                usd_amount = float(usd_amount) if usd_amount is not None else DEFAULT_USD_AMOUNT
+            except Exception:
+                usd_amount = DEFAULT_USD_AMOUNT
             status, resp = place_market_order("buy", usd_amount=usd_amount)
         else:
             # SELL: market sell ALL available BTC for PRODUCT_ID
@@ -166,6 +208,7 @@ def webhook():
 
     except Exception as e:
         print("ERROR:", repr(e))
+        print("TRACEBACK:", traceback.format_exc())
         return jsonify(error="Unhandled exception", details=str(e)), 500
 
 # ─────────────────────────────────────────
