@@ -1,3 +1,10 @@
+
+# Web server & HTTP
 flask==3.0.0
 requests==2.32.3
+
+# JWT with ES256 support (installs cryptography via extra)
 PyJWT[crypto]==2.9.0
+
+# Explicitly ensure cryptography backend is present and recent
+cryptography>=41.0.0
