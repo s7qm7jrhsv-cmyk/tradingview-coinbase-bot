@@ -84,24 +84,17 @@ def place_market_order(side, usd_amount=None):
 def webhook():
     try:
         data = request.get_json(force=True)
-        print("Webhook received:", data)
-
-        action = data.get("action")
-        symbol = data.get("symbol")
-        usd_amount = data.get("usd_amount")
-
-        if symbol != PRODUCT_ID:
-            print("Ignoring symbol:", symbol)
-            return "Ignored", 200
-
-        if action == "buy":
-            place_market_order("buy", usd_amount)
-
-        return "OK", 200
-
     except Exception as e:
-        print("Webhook error:", str(e))
-        return "Error", 200
+        return {"error": "Invalid JSON"}, 400
+
+    action = data.get("action")
+    symbol = data.get("symbol")
+
+    if not action or not symbol:
+        return {"error": "Missing fields"}, 400
+
+    # proceed to Coinbase order logic
+    return {"status": "ok"}, 200
 
 # ─────────────────────────────────────────
 # START SERVER
