@@ -66,6 +66,7 @@ def fetch_accounts():
     )
     return resp.status_code, resp.json()
 
+
 def get_available_btc() -> Optional[str]:
     status, data = fetch_accounts()
     if status >= 300:
@@ -73,12 +74,10 @@ def get_available_btc() -> Optional[str]:
     # Find BTC account and return available balance as string
     for acct in data.get("accounts", []):
         if acct.get("currency") == "BTC":
-            # some payloads expose "available_balance": {"value":"...", "currency":"BTC"}
             ab = acct.get("available_balance") or {}
             val = ab.get("value")
             if val and float(val) > 0:
-                # Coinbase expects base_size as string
-                return val
+                return val  # Coinbase expects base_size as string
             return None
     return None
 
@@ -103,7 +102,6 @@ def place_market_order(side: str, usd_amount: Optional[float] = None, base_size:
     else:
         # Sell by base size (BTC)
         if not base_size:
-            # optionally allow small epsilon to avoid dust; here we require a base_size
             raise ValueError("SELL requires base_size (BTC amount).")
         order["order_configuration"]["market_market_ioc"]["base_size"] = str(base_size)
 
@@ -172,7 +170,7 @@ def webhook():
 
 # ─────────────────────────────────────────
 # HEALTH CHECK (OPTIONAL)
-# ─────────────────────────────────────────# ─────────────────────────────────────────
+# ─────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
@@ -181,3 +179,4 @@ def health():
 # START SERVER
 # ─────────────────────────────────────────
 if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
