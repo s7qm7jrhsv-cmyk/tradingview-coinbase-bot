@@ -1,144 +1,104 @@
-from flask import Flask, request, jsonify
 import os
-import requests
+import json
 import time
 import hmac
 import hashlib
-from datetime import datetime, date
+import requests
+from flask import Flask, request
 
 app = Flask(__name__)
 
-# ───────────────────────────────
-# ENV VARIABLES
-# ───────────────────────────────
-COINBASE_API_KEY = os.environ["COINBASE_API_KEY"]
-COINBASE_API_SECRET = os.environ["COINBASE_API_SECRET"]
-COINBASE_API_PASSPHRASE = os.environ["COINBASE_API_PASSPHRASE"]
+# ─────────────────────────────────────────
+# ENVIRONMENT VARIABLES (Railway)
+# ─────────────────────────────────────────
+COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
+COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET")
+COINBASE_API_PASSPHRASE = os.environ.get("COINBASE_API_PASSPHRASE")
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+COINBASE_API_URL = "https://api.exchange.coinbase.com"
 
-BASE_URL = "https://api.exchange.coinbase.com"
+PRODUCT_ID = "BTC-USDC"   # ✅ correct for BTC-USDC
+USD_AMOUNT = 50           # fallback amount if not provided
 
-daily_pnl = 0.0
-last_pnl_date = date.today()
+# ─────────────────────────────────────────
+# COINBASE SIGNATURE
+# ─────────────────────────────────────────
+def sign_request(timestamp, method, request_path, body=""):
+    message = f"{timestamp}{method}{request_path}{body}"
+    hmac_key = base64.b64decode(COINBASE_API_SECRET)
+    signature = hmac.new(hmac_key, message.encode(), hashlib.sha256)
+    return base64.b64encode(signature.digest()).decode()
 
-# ───────────────────────────────
-# TELEGRAM HELPER
-# ───────────────────────────────
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
-    requests.post(url, json=payload)
-
-# ───────────────────────────────
-# COINBASE AUTH
-# ───────────────────────────────
-import base64
-
-def coinbase_headers(method, request_path, body=""):
+# ─────────────────────────────────────────
+# PLACE ORDER
+# ─────────────────────────────────────────
+def place_market_order(side, usd_amount=None):
     timestamp = str(time.time())
-    message = timestamp + method + request_path + body
+    request_path = "/orders"
 
-    secret_decoded = base64.b64decode(COINBASE_API_SECRET)
+    order = {
+        "type": "market",
+        "side": side,
+        "product_id": PRODUCT_ID
+    }
 
-    signature = hmac.new(
-        secret_decoded,
-        message.encode(),
-        hashlib.sha256
-    ).digest()
+    if side == "buy":
+        order["funds"] = str(usd_amount or USD_AMOUNT)
+    else:
+        order["size"] = "all"
 
-    return {
+    body = json.dumps(order)
+    signature = sign_request(timestamp, "POST", request_path, body)
+
+    headers = {
         "CB-ACCESS-KEY": COINBASE_API_KEY,
-        "CB-ACCESS-SIGN": base64.b64encode(signature).decode(),
+        "CB-ACCESS-SIGN": signature,
         "CB-ACCESS-TIMESTAMP": timestamp,
         "CB-ACCESS-PASSPHRASE": COINBASE_API_PASSPHRASE,
         "Content-Type": "application/json"
     }
 
-# ───────────────────────────────
-# WEBHOOK ENDPOINT
-# ───────────────────────────────
+    response = requests.post(
+        COINBASE_API_URL + request_path,
+        headers=headers,
+        data=body
+    )
+
+    print("Coinbase response:", response.status_code, response.text)
+    return response.text
+
+# ─────────────────────────────────────────
+# WEBHOOK ROUTE (FIXED)
+# ─────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global daily_pnl, last_pnl_date
-
-    data = request.json
-    print("Webhook received:", data)
-
-    # Daily PnL reset & report
-    if date.today() != last_pnl_date:
-        send_telegram(f"📊 Daily PnL Summary: ${daily_pnl:.2f}")
-        daily_pnl = 0.0
-        last_pnl_date = date.today()
-
-    action = data.get("action")
-
     try:
+        raw_data = request.data.decode("utf-8")
+        print("Raw webhook received:", raw_data)
+
+        data = json.loads(raw_data)
+
+        action = data.get("action")
+        symbol = data.get("symbol")
+        usd_amount = data.get("usd_amount")
+
+        if symbol != PRODUCT_ID:
+            print("Ignoring symbol:", symbol)
+            return "Ignored", 200
+
         if action == "buy":
-            usd_amount = data.get("amount_usd", 50)
-
-            order = {
-                "type": "market",
-                "side": "buy",
-                "product_id": "BTC-USDC",
-                "funds": str(usd_amount)
-            }
-
-            body = str(order).replace("'", '"')
-            headers = coinbase_headers("POST", "/orders", body)
-            response = requests.post(BASE_URL + "/orders", headers=headers, data=body)
-
-            result = response.json()
-
-            send_telegram(
-                f"🟢 BUY EXECUTED\n"
-                f"Asset: BTC-USDC\n"
-                f"Amount: ${usd_amount}"
-            )
-
-            return jsonify(result)
-
+            place_market_order("buy", usd_amount)
         elif action == "sell":
-            size = data.get("size")
+            place_market_order("sell")
 
-            order = {
-                "type": "market",
-                "side": "sell",
-                "product_id": "BTC-USDC",
-                "size": str(size)
-            }
-
-            body = str(order).replace("'", '"')
-            headers = coinbase_headers("POST", "/orders", body)
-            response = requests.post(BASE_URL + "/orders", headers=headers, data=body)
-
-            send_telegram(
-                f"🔴 SELL EXECUTED\n"
-                f"Asset: BTC-USDC\n"
-                f"Size: {size} BTC"
-            )
-
-            return jsonify(response.json())
-
-        return jsonify({"status": "ignored"})
+        return "OK", 200
 
     except Exception as e:
-        send_telegram(f"🚨 ERROR ALERT\n{str(e)}")
-        return jsonify({"error": str(e)}), 500
+        print("Webhook error:", str(e))
+        return "Error", 200   # IMPORTANT: always return 200 to TradingView
 
-# ───────────────────────────────
-# HEALTH CHECK
-# ───────────────────────────────
-@app.route("/")
-def health():
-    return "Bot is running", 200
-
-import os
-
+# ─────────────────────────────────────────
+# START SERVER (Railway compatible)
+# ─────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
