@@ -4,6 +4,7 @@ import time
 import requests
 import jwt
 import traceback
+import base64
 from typing import Optional
 from flask import Flask, request, jsonify
 
@@ -13,10 +14,47 @@ app = Flask(__name__)
 # ENV VARIABLES (Railway)
 # ─────────────────────────────────────────
 COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
-COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")  # ES256 PEM
+COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")  # ES256 PEM or JSON-escaped PEM
+COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")  # optional base64 of PEM
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
 DEFAULT_USD_AMOUNT = 50  # used only if buy amount isn't provided
+
+# ─────────────────────────────────────────
+# UTIL: Normalize PEM from env (handles quotes and escaped newlines)
+# ─────────────────────────────────────────
+def normalize_pem(pem: Optional[str]) -> Optional[str]:
+    if pem is None:
+        return None
+    # env var may contain bytes; coerce to str
+    if isinstance(pem, bytes):
+        try:
+            pem = pem.decode('utf-8')
+        except Exception:
+            return None
+    v = pem.strip()
+    # remove surrounding quotes if present
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        v = v[1:-1]
+    # convert escaped newlines to real newlines
+    v = v.replace('\r', '').replace('\\n', '\n')
+    return v
+
+# Try to normalize raw PEM first
+COINBASE_PRIVATE_KEY = normalize_pem(COINBASE_PRIVATE_KEY)
+# Fallback: decode base64 if provided
+if not COINBASE_PRIVATE_KEY and COINBASE_PRIVATE_KEY_B64:
+    try:
+        decoded = base64.b64decode(COINBASE_PRIVATE_KEY_B64)
+        COINBASE_PRIVATE_KEY = normalize_pem(decoded)
+        print("INFO: Loaded COINBASE_PRIVATE_KEY from base64 env")
+    except Exception as e:
+        print("ERROR: Failed to decode COINBASE_PRIVATE_KEY_B64:", repr(e))
+
+# Log first line of PEM to help diagnose formatting
+if COINBASE_PRIVATE_KEY:
+    first_line = COINBASE_PRIVATE_KEY.splitlines()[0] if COINBASE_PRIVATE_KEY.splitlines() else ''
+    print("INFO: PEM first line:", first_line)
 
 # ─────────────────────────────────────────
 # UTIL: Validate env vars per request
@@ -84,9 +122,7 @@ def get_available_btc() -> Optional[str]:
 
     accounts = data.get("accounts") or []
     for acct in accounts:
-        # Some payloads use "currency" key for symbol
         if acct.get("currency") == "BTC":
-            # available_balance: {"value":"...","currency":"BTC"}
             ab = acct.get("available_balance") or {}
             val = ab.get("value")
             if val is not None:
@@ -114,10 +150,8 @@ def place_market_order(side: str, usd_amount: Optional[float] = None, base_size:
     }
 
     if side.lower() == "buy":
-        # Buy by quote (USDC)
         order["order_configuration"]["market_market_ioc"]["quote_size"] = str(usd_amount or DEFAULT_USD_AMOUNT)
     else:
-        # Sell by base size (BTC)
         if not base_size:
             raise ValueError("SELL requires base_size (BTC amount).")
         order["order_configuration"]["market_market_ioc"]["base_size"] = str(base_size)
@@ -147,7 +181,6 @@ def webhook():
     try:
         data = json.loads(raw_body)
     except Exception:
-        # Fallback: parse simple plain-text commands like "BUY BTCUSDC" or "SELL BTC-USDC"
         text = raw_body.strip()
         upper = text.upper()
         if upper.startswith("BUY"):
@@ -156,7 +189,6 @@ def webhook():
             data = {"action": "sell"}
         else:
             return jsonify(error="Body is not valid JSON and no BUY/SELL keyword found"), 400
-        # Attempt to extract symbol token
         tokens = upper.split()
         sym = None
         for tok in tokens:
@@ -165,7 +197,6 @@ def webhook():
                 break
         data["symbol"] = sym or PRODUCT_ID
 
-    # Validate env per request
     try:
         require_env()
     except RuntimeError as e:
@@ -175,7 +206,6 @@ def webhook():
     action = (data.get("action") or "").strip().lower()
     symbol = (data.get("symbol") or "").strip().upper()
 
-    # Normalize symbol (accept missing hyphen)
     if symbol == "BTCUSDC":
         symbol = "BTC-USDC"
 
@@ -195,7 +225,6 @@ def webhook():
                 usd_amount = DEFAULT_USD_AMOUNT
             status, resp = place_market_order("buy", usd_amount=usd_amount)
         else:
-            # SELL: market sell ALL available BTC for PRODUCT_ID
             base_size = get_available_btc()
             if not base_size:
                 return jsonify(error="No BTC available to sell"), 400
