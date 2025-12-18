@@ -13,36 +13,38 @@ app = Flask(__name__)
 # ─────────────────────────────────────────
 # ENV VARIABLES (Railway)
 # ─────────────────────────────────────────
-COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
-COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")  # ES256 PEM or JSON-escaped PEM
-COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")  # optional base64 of PEM
+# Coinbase CDP key metadata
+COINBASE_API_KEY_ID = os.environ.get("COINBASE_API_KEY_ID")   # kid (API key id)
+COINBASE_API_KEY_NAME = os.environ.get("COINBASE_API_KEY_NAME")  # organizations/{org_id}/apiKeys/{key_id}
+
+# Private key (EC/ES256) in PEM or Base64
+COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")            # raw PEM (multi-line or JSON-escaped)
+COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")    # optional base64 of PEM
+
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
-DEFAULT_USD_AMOUNT = 50  # used only if buy amount isn't provided
+DEFAULT_USD_AMOUNT = 50
 
 # ─────────────────────────────────────────
-# UTIL: Normalize PEM from env (handles quotes and escaped newlines)
+# PEM normalization helpers
 # ─────────────────────────────────────────
 def normalize_pem(pem: Optional[str]) -> Optional[str]:
     if pem is None:
         return None
-    # env var may contain bytes; coerce to str
     if isinstance(pem, bytes):
         try:
             pem = pem.decode('utf-8')
         except Exception:
             return None
     v = pem.strip()
-    # remove surrounding quotes if present
+    # Strip surrounding quotes
     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
         v = v[1:-1]
-    # convert escaped newlines to real newlines
+    # Convert escaped newlines to real newlines
     v = v.replace('\r', '').replace('\\n', '\n')
     return v
 
-# Try to normalize raw PEM first
 COINBASE_PRIVATE_KEY = normalize_pem(COINBASE_PRIVATE_KEY)
-# Fallback: decode base64 if provided
 if not COINBASE_PRIVATE_KEY and COINBASE_PRIVATE_KEY_B64:
     try:
         decoded = base64.b64decode(COINBASE_PRIVATE_KEY_B64)
@@ -51,37 +53,46 @@ if not COINBASE_PRIVATE_KEY and COINBASE_PRIVATE_KEY_B64:
     except Exception as e:
         print("ERROR: Failed to decode COINBASE_PRIVATE_KEY_B64:", repr(e))
 
-# Log first line of PEM to help diagnose formatting
 if COINBASE_PRIVATE_KEY:
     first_line = COINBASE_PRIVATE_KEY.splitlines()[0] if COINBASE_PRIVATE_KEY.splitlines() else ''
     print("INFO: PEM first line:", first_line)
 
 # ─────────────────────────────────────────
-# UTIL: Validate env vars per request
+# Require env vars per request
 # ─────────────────────────────────────────
 def require_env():
     missing = []
-    if not COINBASE_API_KEY:
-        missing.append("COINBASE_API_KEY")
+    if not COINBASE_API_KEY_ID:
+        missing.append("COINBASE_API_KEY_ID")
+    if not COINBASE_API_KEY_NAME:
+        missing.append("COINBASE_API_KEY_NAME")
     if not COINBASE_PRIVATE_KEY:
         missing.append("COINBASE_PRIVATE_KEY")
     if missing:
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
 # ─────────────────────────────────────────
-# CREATE JWT (Coinbase Advanced Trade)
+# JWT creation per Coinbase Advanced Trade REST (ES256)
+# Payload must include: iss, sub (key name), nbf, exp, aud(host), uri("METHOD host/path"), nonce header, kid header
 # ─────────────────────────────────────────
-def create_jwt() -> str:
+DEF_HOST = "api.coinbase.com"
+
+def build_uri(method: str, path: str, host: str = DEF_HOST) -> str:
+    # Example: "POST api.coinbase.com/api/v3/brokerage/orders"
+    return f"{method.upper()} {host}{path}"
+
+def create_jwt(method: str, path: str) -> str:
     now = int(time.time())
     payload = {
-        "sub": COINBASE_API_KEY,
-        "iss": "coinbase-cloud",
+        "iss": "cdp",                                 # per docs
+        "sub": COINBASE_API_KEY_NAME,                  # organizations/{org_id}/apiKeys/{key_id}
         "nbf": now,
-        "exp": now + 120,  # 2 minutes
-        "aud": ["coinbase-cloud"],
+        "exp": now + 120,
+        "aud": DEF_HOST,                               # host for REST
+        "uri": build_uri(method, path, DEF_HOST),      # METHOD + host + path
     }
     headers = {
-        "kid": COINBASE_API_KEY,
+        "kid": COINBASE_API_KEY_ID,                    # key id
         "nonce": str(int(time.time() * 1000)),
     }
     try:
@@ -92,53 +103,32 @@ def create_jwt() -> str:
         raise
 
 
-def auth_headers() -> dict:
-    token = create_jwt()
+def auth_headers(method: str, path: str) -> dict:
+    token = create_jwt(method, path)
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
 # ─────────────────────────────────────────
-# FETCH ACCOUNT BALANCES (sell-all helper)
+# REST helpers
 # ─────────────────────────────────────────
+ACCOUNTS_PATH = "/api/v3/brokerage/accounts"
+ORDERS_PATH   = "/api/v3/brokerage/orders"
+
+
 def fetch_accounts():
-    headers = auth_headers()
-    resp = requests.get(
-        f"{COINBASE_API_URL}/api/v3/brokerage/accounts",
-        headers=headers,
-        timeout=10,
-    )
+    headers = auth_headers("GET", ACCOUNTS_PATH)
+    resp = requests.get(f"{COINBASE_API_URL}{ACCOUNTS_PATH}", headers=headers, timeout=10)
+    print("Coinbase response (accounts):", resp.status_code, resp.text)
     try:
         return resp.status_code, resp.json()
     except Exception:
         return resp.status_code, {"raw": resp.text}
 
 
-def get_available_btc() -> Optional[str]:
-    status, data = fetch_accounts()
-    if status >= 300:
-        raise RuntimeError(f"Failed to fetch accounts: {data}")
-
-    accounts = data.get("accounts") or []
-    for acct in accounts:
-        if acct.get("currency") == "BTC":
-            ab = acct.get("available_balance") or {}
-            val = ab.get("value")
-            if val is not None:
-                try:
-                    if float(val) > 0:
-                        return str(val)
-                except Exception:
-                    pass
-            return None
-    return None
-
-# ─────────────────────────────────────────
-# PLACE MARKET ORDER
-# ─────────────────────────────────────────
 def place_market_order(side: str, usd_amount: Optional[float] = None, base_size: Optional[str] = None):
-    headers = auth_headers()
+    headers = auth_headers("POST", ORDERS_PATH)
 
     order = {
         "client_order_id": str(int(time.time() * 1000)),
@@ -156,27 +146,22 @@ def place_market_order(side: str, usd_amount: Optional[float] = None, base_size:
             raise ValueError("SELL requires base_size (BTC amount).")
         order["order_configuration"]["market_market_ioc"]["base_size"] = str(base_size)
 
-    resp = requests.post(
-        f"{COINBASE_API_URL}/api/v3/brokerage/orders",
-        headers=headers,
-        json=order,
-        timeout=10,
-    )
-    print("Coinbase response:", resp.status_code, resp.text)
+    resp = requests.post(f"{COINBASE_API_URL}{ORDERS_PATH}", headers=headers, json=order, timeout=10)
+    print("Coinbase response (order):", resp.status_code, resp.text)
     try:
         return resp.status_code, resp.json()
     except Exception:
         return resp.status_code, {"raw": resp.text}
 
 # ─────────────────────────────────────────
-# WEBHOOK ENDPOINT (TradingView)
+# Webhook endpoint
 # ─────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     raw_body = request.data.decode("utf-8", errors="ignore")
     print("RAW WEBHOOK BODY:", raw_body)
 
-    # Try JSON first
+    # Parse JSON or fallback plain text
     data = None
     try:
         data = json.loads(raw_body)
@@ -225,7 +210,18 @@ def webhook():
                 usd_amount = DEFAULT_USD_AMOUNT
             status, resp = place_market_order("buy", usd_amount=usd_amount)
         else:
-            base_size = get_available_btc()
+            status_accounts, data_accounts = fetch_accounts()
+            if status_accounts >= 300:
+                return jsonify(error="Failed to fetch accounts", details=data_accounts), 400
+            # derive base_size from accounts JSON
+            base_size = None
+            for acct in data_accounts.get("accounts", []):
+                if acct.get("currency") == "BTC":
+                    ab = acct.get("available_balance") or {}
+                    val = ab.get("value")
+                    if val and float(val) > 0:
+                        base_size = str(val)
+                        break
             if not base_size:
                 return jsonify(error="No BTC available to sell"), 400
             status, resp = place_market_order("sell", base_size=base_size)
@@ -241,14 +237,11 @@ def webhook():
         return jsonify(error="Unhandled exception", details=str(e)), 500
 
 # ─────────────────────────────────────────
-# HEALTH CHECK (OPTIONAL)
+# Health
 # ─────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
-# ─────────────────────────────────────────
-# START SERVER
-# ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
