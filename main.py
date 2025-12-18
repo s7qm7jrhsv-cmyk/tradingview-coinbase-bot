@@ -86,27 +86,22 @@ def place_market_order(side: str, usd_amount: float | None = None):
 # ─────────────────────────────────────────
 # WEBHOOK ENDPOINT (TradingView)
 # ─────────────────────────────────────────
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Ensure TradingView sends raw JSON
-    if not request.data:
-        return jsonify(error="Empty request body"), 400
+    raw_body = request.data.decode("utf-8")
+    print("RAW WEBHOOK BODY:", raw_body)
 
     try:
-        data = request.get_json(force=True)
+        data = json.loads(raw_body)
     except Exception:
-        return jsonify(error="Invalid JSON"), 400
+        return jsonify(error="Body is not valid JSON"), 400
 
     action = data.get("action")
     symbol = data.get("symbol")
-    usd_amount = data.get("usd_amount")
+    usd_amount = float(data.get("usd_amount", DEFAULT_USD_AMOUNT))
 
     if action not in {"buy", "sell"}:
         return jsonify(error="Invalid or missing action"), 400
-
-    if symbol != PRODUCT_ID:
-        return jsonify(error="Invalid symbol"), 400
 
     if action == "buy":
         status, resp = place_market_order("buy", usd_amount)
