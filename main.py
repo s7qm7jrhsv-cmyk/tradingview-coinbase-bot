@@ -186,7 +186,7 @@ def fetch_fills(product_id: str = "BTC-USDC", limit: int = 50):
     params = {"product_id": product_id, "limit": str(limit)}
     resp = requests.get(f"{COINBASE_API_URL}{FILLS_PATH}", headers=headers, params=params, timeout=10)
     print("Order fills:", resp.status_code, resp.text)
-       try:
+    try:
         return resp.status_code, resp.json()
     except Exception:
 
