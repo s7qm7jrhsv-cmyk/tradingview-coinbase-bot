@@ -13,7 +13,6 @@ app = Flask(__name__)
 # ─────────────────────────────────────────
 COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY")
 COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET")
-COINBASE_API_PASSPHRASE = os.environ.get("COINBASE_API_PASSPHRASE")
 
 COINBASE_API_URL = "https://api.exchange.coinbase.com"
 
@@ -54,7 +53,6 @@ def place_market_order(side, usd_amount=None):
         "CB-ACCESS-KEY": COINBASE_API_KEY,
         "CB-ACCESS-SIGN": signature,
         "CB-ACCESS-TIMESTAMP": timestamp,
-        "CB-ACCESS-PASSPHRASE": COINBASE_API_PASSPHRASE,
         "Content-Type": "application/json"
     }
 
