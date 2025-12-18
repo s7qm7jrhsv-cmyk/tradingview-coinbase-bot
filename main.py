@@ -180,3 +180,13 @@ def health():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
+
+message_buy  = '{"action":"buy","symbol":"BTC-USDC"}'message_buy  = '{"action":"buy
+message_sell = '{"action":"sell","symbol":"BTC-USDC"}'
+
+if final_entry
+    alert(message_buy, alert.freq_once_per_bar_close)
+
+if trade_closed
+
