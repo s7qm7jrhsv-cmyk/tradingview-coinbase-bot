@@ -6,54 +6,76 @@ import jwt
 import traceback
 import base64
 import secrets
+import threading
 from typing import Optional
 from flask import Flask, request, jsonify
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────
 # ENV VARIABLES (Railway / GitHub Actions)
 # ─────────────────────────────────────────
-# Coinbase CDP key metadata
-COINBASE_API_KEY_ID = os.environ.get("COINBASE_API_KEY_ID")  # optional
 COINBASE_API_KEY_NAME = os.environ.get("COINBASE_API_KEY_NAME")  # organizations/{org_id}/apiKeys/{key_id}
-
-# Private key (EC/ES256) in PEM or Base64
-COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")  # PEM as single line with \n
-COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")  # optional base64 of PEM
+COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")    # PEM as single line with \n
+# Optional base64 alternative
+COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")
 
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
 DEFAULT_USD_AMOUNT = 50
 
+# Telegram bot config
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_PARSE_MODE = os.environ.get("TELEGRAM_PARSE_MODE", "HTML")
+
+# Daily PnL scheduler config
+DAILY_PNL_ENABLED = os.environ.get("DAILY_PNL_ENABLED", "0") == "1"
+DAILY_PNL_HOUR_UTC = int(os.environ.get("DAILY_PNL_HOUR_UTC", "13"))  # e.g., 13:00 UTC (~08:00 ET)
+
+# ─────────────────────────────────────────
+# Telegram helper
+# ─────────────────────────────────────────
+def send_telegram(text: str):
+    """Send a Telegram message via Bot API."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": TELEGRAM_PARSE_MODE,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        print("TELEGRAM status:", resp.status_code, resp.text)
+    except Exception as e:
+        print("WARN: Telegram send failed:", repr(e))
+
 # ─────────────────────────────────────────
 # PEM normalization helpers
 # ─────────────────────────────────────────
 def normalize_pem(pem: Optional[str]) -> Optional[str]:
-    """Normalize a PEM string coming from environment variables.
-    - Strip quotes
-    - Convert literal \n to real newlines
-    - Remove literal \r and actual carriage returns
-    """
+    """Normalize PEM coming from env: strip quotes, convert \n to newlines, remove \r."""
     if pem is None:
         return None
     if isinstance(pem, bytes):
         try:
-            pem = pem.decode('utf-8')
+            pem = pem.decode("utf-8")
         except Exception:
             return None
     v = pem.strip()
-
-    # Strip surrounding quotes if present
     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
         v = v[1:-1]
-
-    # Convert escaped newlines -> real newlines; remove \r (literal) and actual CRs
     v = v.replace("\\r", "").replace("\r", "").replace("\\n", "\n")
     return v
 
 COINBASE_PRIVATE_KEY = normalize_pem(COINBASE_PRIVATE_KEY)
-
 if not COINBASE_PRIVATE_KEY and COINBASE_PRIVATE_KEY_B64:
     try:
         decoded = base64.b64decode(COINBASE_PRIVATE_KEY_B64)
@@ -64,10 +86,8 @@ if not COINBASE_PRIVATE_KEY and COINBASE_PRIVATE_KEY_B64:
 
 if COINBASE_PRIVATE_KEY:
     lines = COINBASE_PRIVATE_KEY.splitlines()
-    first_line = lines[0] if lines else ''
-    last_line = lines[-1] if lines else ''
-    print("INFO: PEM first line:", first_line)
-    print("INFO: PEM last line:", last_line)
+    print("INFO: PEM first line:", lines[0] if lines else "")
+    print("INFO: PEM last line:", lines[-1] if lines else "")
 
 # ─────────────────────────────────────────
 # Require env vars per request
@@ -83,27 +103,23 @@ def require_env():
 
 # ─────────────────────────────────────────
 # JWT creation for Coinbase Advanced Trade REST (ES256)
-# Payload: iss, sub (key name), nbf, exp, uri; headers: kid (key name), nonce
 # ─────────────────────────────────────────
 DEF_HOST = "api.coinbase.com"
 
 def build_uri(method: str, path: str, host: str = DEF_HOST) -> str:
-    # Example: "POST api.coinbase.com/api/v3/brokerage/orders"
     return f"{method.upper()} {host}{path}"
 
 def create_jwt(method: str, path: str) -> str:
     now = int(time.time())
     payload = {
-        "iss": "cdp",  # per Coinbase docs/SDK
-        "sub": COINBASE_API_KEY_NAME,  # organizations/{org_id}/apiKeys/{key_id}
+        "iss": "cdp",
+        "sub": COINBASE_API_KEY_NAME,
         "nbf": now,
         "exp": now + 120,
-        "uri": build_uri(method, path, DEF_HOST),  # METHOD + host + path
+        "uri": build_uri(method, path, DEF_HOST),
     }
     headers = {
-        # IMPORTANT: kid should be the API key NAME (same as sub), per official SDK
-        "kid": COINBASE_API_KEY_NAME,
-        # Use random hex for nonce, as in the SDK
+        "kid": COINBASE_API_KEY_NAME,  # important: kid = key name (same as sub)
         "nonce": secrets.token_hex(),
     }
     try:
@@ -125,6 +141,10 @@ def auth_headers(method: str, path: str) -> dict:
 # ─────────────────────────────────────────
 ACCOUNTS_PATH = "/api/v3/brokerage/accounts"
 ORDERS_PATH = "/api/v3/brokerage/orders"
+BEST_BID_ASK_PATH = "/api/v3/brokerage/best_bid_ask"
+ORDER_DETAILS_PATH_TMPL = "/api/v3/brokerage/orders/historical/{order_id}"
+FILLS_PATH = "/api/v3/brokerage/orders/historical/fills"
+TRANSACTION_SUMMARY_PATH = "/api/v3/brokerage/transaction_summary"
 
 def fetch_accounts():
     headers = auth_headers("GET", ACCOUNTS_PATH)
@@ -159,6 +179,67 @@ def place_market_order(side: str, usd_amount: Optional[float] = None, base_size:
     except Exception:
         return resp.status_code, {"raw": resp.text}
 
+# Best bid/ask for price calculation (mid price from first bid/ask)
+# Docs: GET /api/v3/brokerage/best_bid_ask
+def fetch_best_bid_ask(product_id: str):
+    headers = auth_headers("GET", BEST_BID_ASK_PATH)
+    params = {"product_ids": product_id}
+    resp = requests.get(f"{COINBASE_API_URL}{BEST_BID_ASK_PATH}", headers=headers, params=params, timeout=10)
+    print("Best bid/ask:", resp.status_code, resp.text)
+    try:
+        data = resp.json()
+        books = data.get("pricebooks", [])
+        for b in books:
+            if b.get("product_id") == product_id:
+                bids = b.get("bids", [])
+                asks = b.get("asks", [])
+                bid_price = float(bids[0]["price"]) if bids else None
+                ask_price = float(asks[0]["price"]) if asks else None
+                if bid_price and ask_price:
+                    return (bid_price + ask_price) / 2.0
+                return bid_price or ask_price
+        return None
+    except Exception:
+        return None
+
+def fetch_order_details(order_id: str):
+    path = ORDER_DETAILS_PATH_TMPL.format(order_id=order_id)
+    headers = auth_headers("GET", path)
+    resp = requests.get(f"{COINBASE_API_URL}{path}", headers=headers, timeout=10)
+    print("Order details:", resp.status_code, resp.text)
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
+
+def fetch_fills(product_id: str = "BTC-USDC", limit: int = 50):
+    headers = auth_headers("GET", FILLS_PATH)
+    params = {"product_id": product_id, "limit": str(limit)}
+    resp = requests.get(f"{COINBASE_API_URL}{FILLS_PATH}", headers=headers, params=params, timeout=10)
+    print("Order fills:", resp.status_code, resp.text)
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
+
+def fetch_transaction_summary():
+    headers = auth_headers("GET", TRANSACTION_SUMMARY_PATH)
+    resp = requests.get(f"{COINBASE_API_URL}{TRANSACTION_SUMMARY_PATH}", headers=headers, timeout=10)
+    print("Transaction summary:", resp.status_code, resp.text)
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
+
+# ─────────────────────────────────────────
+# Utility formatting
+# ─────────────────────────────────────────
+def fmt_usd(x: float) -> str:
+    return f"${x:,.2f}"
+
+def fmt_btc(x: float) -> str:
+    return f"{x:.8f} BTC"
+
 # ─────────────────────────────────────────
 # Webhook endpoint
 # ─────────────────────────────────────────
@@ -179,6 +260,7 @@ def webhook():
         elif upper.startswith("SELL"):
             data = {"action": "sell"}
         else:
+            send_telegram("<b>Error:</b> Body not valid JSON and no BUY/SELL keyword found.")
             return jsonify(error="Body is not valid JSON and no BUY/SELL keyword found"), 400
         tokens = upper.split()
         sym = None
@@ -192,6 +274,7 @@ def webhook():
         require_env()
     except RuntimeError as e:
         print("ERROR: Env validation failed:", str(e))
+        send_telegram(f"<b>Error:</b> Env validation failed: {str(e)}")
         return jsonify(error=str(e)), 500
 
     action = (data.get("action") or "").strip().lower()
@@ -213,9 +296,28 @@ def webhook():
             except Exception:
                 usd_amount = DEFAULT_USD_AMOUNT
             status, resp = place_market_order("buy", usd_amount=usd_amount)
-        else:
+
+            if status < 300:
+                # Telegram: Buy executed
+                send_telegram(f"✅ <b>Buy executed</b> — {PRODUCT_ID} • Amount: {fmt_usd(usd_amount)}")
+                # Optional: confirm exact BTC filled
+                try:
+                    order_id = resp.get("success_response", {}).get("order_id") if isinstance(resp, dict) else None
+                    if order_id:
+                        d_status, d_json = fetch_order_details(order_id)
+                        print("DEBUG: order_id =", order_id, "details status =", d_status)
+                        f_status, f_json = fetch_fills(product_id=PRODUCT_ID, limit=10)
+                        print("DEBUG: fills status =", f_status)
+                except Exception as _e:
+                    print("WARN: Unable to fetch order details/fills:", repr(_e))
+            else:
+                send_telegram(f"❌ <b>Error alert</b> — Buy failed: {resp}")
+                return jsonify(error="Coinbase order failed", details=resp), 400
+
+        else:  # SELL
             status_accounts, data_accounts = fetch_accounts()
             if status_accounts >= 300:
+                send_telegram(f"❌ <b>Error alert</b> — Fetch accounts failed: {data_accounts}")
                 return jsonify(error="Failed to fetch accounts", details=data_accounts), 400
 
             # derive base_size from accounts JSON
@@ -228,16 +330,28 @@ def webhook():
                         base_size = str(val)
                         break
             if not base_size:
+                send_telegram("❌ <b>Error alert</b> — No BTC available to sell")
                 return jsonify(error="No BTC available to sell"), 400
+
             status, resp = place_market_order("sell", base_size=base_size)
 
-        if status >= 300:
-            return jsonify(error="Coinbase order failed", details=resp), 400
+            if status < 300:
+                # Estimate USD amount using best bid/ask
+                price = fetch_best_bid_ask(PRODUCT_ID) or 0.0
+                usd_estimate = float(base_size) * float(price)
+                send_telegram(
+                    f"✅ <b>Sell executed</b> — {PRODUCT_ID} • Qty: {fmt_btc(float(base_size))} • Est: {fmt_usd(usd_estimate)}"
+                )
+            else:
+                send_telegram(f"❌ <b>Error alert</b> — Sell failed: {resp}")
+                return jsonify(error="Coinbase order failed", details=resp), 400
+
         return jsonify(status="order placed", action=action, details=resp), 200
 
     except Exception as e:
         print("ERROR:", repr(e))
         print("TRACEBACK:", traceback.format_exc())
+        send_telegram(f"❌ <b>Error alert</b> — Unhandled: {str(e)}")
         return jsonify(error="Unhandled exception", details=str(e)), 500
 
 # ─────────────────────────────────────────
@@ -246,6 +360,112 @@ def webhook():
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
+
+# Optional: order details/fills HTTP endpoints
+@app.route("/order/<order_id>", methods=["GET"])
+def order_details_http(order_id):
+    try:
+        require_env()
+        status, data = fetch_order_details(order_id)
+        return jsonify({"status": status, "data": data}), 200
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+@app.route("/fills", methods=["GET"])
+def fills_http():
+    try:
+        require_env()
+        status, data = fetch_fills(product_id=PRODUCT_ID, limit=10)
+        return jsonify({"status": status, "data": data}), 200
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+# ─────────────────────────────────────────
+# Daily PnL scheduler (once per day at DAILY_PNL_HOUR_UTC)
+# Computes naive PnL from recent fills (last 24h): sum(SELL) - sum(BUY) - fees
+# Also includes fee tier / total fees from transaction_summary when available.
+# ─────────────────────────────────────────
+
+def compute_daily_pnl_and_notify():
+    try:
+        require_env()
+        status, fills = fetch_fills(product_id=PRODUCT_ID, limit=100)
+        buys_usd, sells_usd, fees_usd = 0.0, 0.0, 0.0
+        count = 0
+        now = time.time()
+        cutoff = now - 24 * 3600
+
+        if isinstance(fills, dict):
+            items = fills.get("fills", fills.get("orders", []))
+            for it in items or []:
+                t = it.get("trade_time") or it.get("time") or it.get("created_time")
+                ts_ok = True
+                if isinstance(t, str):
+                    try:
+                        dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+                        ts_ok = (dt.timestamp() >= cutoff)
+                    except Exception:
+                        ts_ok = True
+                side = (it.get("side") or it.get("order_side") or "").upper()
+                price = float(it.get("price") or 0.0)
+                size = float(it.get("size") or it.get("base_size") or 0.0)
+                fee = float(it.get("fee") or 0.0)
+                if ts_ok and size > 0:
+                    usd = price * size if price > 0 else 0.0
+                    if side == "BUY":
+                        buys_usd += usd
+                    elif side == "SELL":
+                        sells_usd += usd
+                    fees_usd += fee
+                    count += 1
+
+        ts_status, ts_json = fetch_transaction_summary()
+        tier = None
+        total_fees_all = None
+        if ts_status < 300 and isinstance(ts_json, dict):
+            tier = (ts_json.get("fee_tier") or {}).get("pricing_tier")
+            total_fees_all = ts_json.get("total_fees")
+
+        pnl = sells_usd - buys_usd - fees_usd
+        msg = (
+            f"📊 <b>Daily PnL</b> — {PRODUCT_ID}\n"
+            f"Buys: {fmt_usd(buys_usd)} | Sells: {fmt_usd(sells_usd)} | Fees: {fmt_usd(fees_usd)}\n"
+            f"Net PnL 24h: <b>{fmt_usd(pnl)}</b>\n"
+            f"Trades counted: {count}"
+        )
+        if tier:
+            msg += f"\nFee tier: {tier}"
+        if total_fees_all is not None:
+            try:
+                msg += f"\nTotal fees (all-time): {fmt_usd(float(total_fees_all))}"
+            except Exception:
+                msg += f"\nTotal fees (all-time): {total_fees_all}"
+        send_telegram(msg)
+    except Exception as e:
+        print("WARN: Daily PnL failed:", repr(e))
+        send_telegram(f"❌ <b>Error alert</b> — Daily PnL failed: {str(e)}")
+
+def start_daily_pnl_thread():
+    if not DAILY_PNL_ENABLED:
+        return
+    def worker():
+        while True:
+            try:
+                now = datetime.utcnow()
+                next_run = now.replace(hour=DAILY_PNL_HOUR_UTC, minute=0, second=0, microsecond=0)
+                if next_run <= now:
+                    next_run += timedelta(days=1)
+                sleep_seconds = (next_run - now).total_seconds()
+                print(f"Daily PnL scheduled in {int(sleep_seconds)}s for {next_run.isoformat()} UTC")
+                time.sleep(max(5, sleep_seconds))
+                compute_daily_pnl_and_notify()
+            except Exception as e:
+                print("Daily PnL thread error:", repr(e))
+                time.sleep(60)
+    threading.Thread(target=worker, daemon=True).start()
+
+# Start scheduler
+start_daily_pnl_thread()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
