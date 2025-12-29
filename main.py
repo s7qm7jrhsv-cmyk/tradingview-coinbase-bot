@@ -26,7 +26,7 @@ COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")  # optiona
 
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
-DEFAULT_USD_AMOUNT = 500
+DEFAULT_USD_AMOUNT = 250
 
 # ─────────────────────────────────────────
 # PEM normalization helpers
