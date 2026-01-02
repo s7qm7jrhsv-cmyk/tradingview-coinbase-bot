@@ -11,32 +11,60 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# This one works!
+# This one works with Telegram notifications!
 
 # ─────────────────────────────────────────
 # ENV VARIABLES (Railway / GitHub Actions)
 # ─────────────────────────────────────────
 # Coinbase CDP key metadata
-COINBASE_API_KEY_ID = os.environ.get("COINBASE_API_KEY_ID")  # optional
-COINBASE_API_KEY_NAME = os.environ.get("COINBASE_API_KEY_NAME")  # organizations/{org_id}/apiKeys/{key_id}
+COINBASE_API_KEY_ID = os.environ.get("COINBASE_API_KEY_ID")
+COINBASE_API_KEY_NAME = os.environ.get("COINBASE_API_KEY_NAME")
 
 # Private key (EC/ES256) in PEM or Base64
-COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")  # PEM as single line with \n
-COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")  # optional base64 of PEM
+COINBASE_PRIVATE_KEY = os.environ.get("COINBASE_PRIVATE_KEY")
+COINBASE_PRIVATE_KEY_B64 = os.environ.get("COINBASE_PRIVATE_KEY_B64")
+
+# ═════════════════════════════════════════
+# TELEGRAM CONFIGURATION
+# ═════════════════════════════════════════
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # Your bot token from BotFather
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")      # Your chat ID
 
 COINBASE_API_URL = "https://api.coinbase.com"
 PRODUCT_ID = "BTC-USDC"
 DEFAULT_USD_AMOUNT = 250
 
 # ─────────────────────────────────────────
+# TELEGRAM NOTIFICATION HELPER
+# ─────────────────────────────────────────
+def send_telegram_message(message: str):
+    """
+    Send a message to Telegram.
+    This is where ALL notifications are sent from.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("WARNING: Telegram not configured. Skipping notification:", message)
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"  # Allows bold, italic formatting
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            print(f"✅ Telegram notification sent: {message[:50]}...")
+        else:
+            print(f"❌ Telegram API error: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print(f"❌ Failed to send Telegram message: {repr(e)}")
+
+# ─────────────────────────────────────────
 # PEM normalization helpers
 # ─────────────────────────────────────────
 def normalize_pem(pem: Optional[str]) -> Optional[str]:
-    """Normalize a PEM string coming from environment variables.
-    - Strip quotes
-    - Convert literal \n to real newlines
-    - Remove literal \r and actual carriage returns
-    """
     if pem is None:
         return None
     if isinstance(pem, bytes):
@@ -45,12 +73,8 @@ def normalize_pem(pem: Optional[str]) -> Optional[str]:
         except Exception:
             return None
     v = pem.strip()
-
-    # Strip surrounding quotes if present
     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
         v = v[1:-1]
-
-    # Convert escaped newlines -> real newlines; remove \r (literal) and actual CRs
     v = v.replace("\\r", "").replace("\r", "").replace("\\n", "\n")
     return v
 
@@ -81,31 +105,32 @@ def require_env():
     if not COINBASE_PRIVATE_KEY:
         missing.append("COINBASE_PRIVATE_KEY")
     if missing:
+        # ═════════════════════════════════════════
+        # NOTIFICATION #4: Connection/Configuration Error
+        # ═════════════════════════════════════════
+        error_msg = f"⚠️ <b>Railway Configuration Error</b>\n\nMissing: {', '.join(missing)}"
+        send_telegram_message(error_msg)
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
 # ─────────────────────────────────────────
 # JWT creation for Coinbase Advanced Trade REST (ES256)
-# Payload: iss, sub (key name), nbf, exp, uri; headers: kid (key name), nonce
 # ─────────────────────────────────────────
 DEF_HOST = "api.coinbase.com"
 
 def build_uri(method: str, path: str, host: str = DEF_HOST) -> str:
-    # Example: "POST api.coinbase.com/api/v3/brokerage/orders"
     return f"{method.upper()} {host}{path}"
 
 def create_jwt(method: str, path: str) -> str:
     now = int(time.time())
     payload = {
-        "iss": "cdp",  # per Coinbase docs/SDK
-        "sub": COINBASE_API_KEY_NAME,  # organizations/{org_id}/apiKeys/{key_id}
+        "iss": "cdp",
+        "sub": COINBASE_API_KEY_NAME,
         "nbf": now,
         "exp": now + 120,
-        "uri": build_uri(method, path, DEF_HOST),  # METHOD + host + path
+        "uri": build_uri(method, path, DEF_HOST),
     }
     headers = {
-        # IMPORTANT: kid should be the API key NAME (same as sub), per official SDK
         "kid": COINBASE_API_KEY_NAME,
-        # Use random hex for nonce, as in the SDK
         "nonce": secrets.token_hex(),
     }
     try:
@@ -214,13 +239,55 @@ def webhook():
                 usd_amount = float(usd_amount) if usd_amount is not None else DEFAULT_USD_AMOUNT
             except Exception:
                 usd_amount = DEFAULT_USD_AMOUNT
+            
+            # Execute BUY order
             status, resp = place_market_order("buy", usd_amount=usd_amount)
-        else:
+            
+            if status >= 300:
+                # ═════════════════════════════════════════
+                # NOTIFICATION #3: Order Failed
+                # ═════════════════════════════════════════
+                error_details = resp.get("error_response", {}).get("message", "Unknown error")
+                message = (
+                    f"❌ <b>BUY Order FAILED</b>\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Amount: ${usd_amount}\n"
+                    f"Error: {error_details}"
+                )
+                send_telegram_message(message)
+                return jsonify(error="Coinbase order failed", details=resp), 400
+            
+            # ═════════════════════════════════════════
+            # NOTIFICATION #1: Order Successfully Opened
+            # ═════════════════════════════════════════
+            order_id = resp.get("success_response", {}).get("order_id", "N/A")
+            message = (
+                f"✅ <b>BUY Order Opened</b>\n\n"
+                f"Symbol: {symbol}\n"
+                f"Amount: ${usd_amount}\n"
+                f"Order ID: {order_id}\n"
+                f"Status: Success"
+            )
+            send_telegram_message(message)
+            
+            return jsonify(status="order placed", action=action, details=resp), 200
+            
+        else:  # SELL
+            # Fetch account balance
             status_accounts, data_accounts = fetch_accounts()
             if status_accounts >= 300:
+                # ═════════════════════════════════════════
+                # NOTIFICATION #3: Order Failed (account fetch)
+                # ═════════════════════════════════════════
+                message = (
+                    f"❌ <b>SELL Order FAILED</b>\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Error: Failed to fetch account balance"
+                )
+                send_telegram_message(message)
                 return jsonify(error="Failed to fetch accounts", details=data_accounts), 400
 
-            # derive base_size from accounts JSON
+            # Derive base_size from accounts JSON
             base_size = None
             for acct in data_accounts.get("accounts", []):
                 if acct.get("currency") == "BTC":
@@ -229,25 +296,78 @@ def webhook():
                     if val and float(val) > 0:
                         base_size = str(val)
                         break
+            
             if not base_size:
+                # ═════════════════════════════════════════
+                # NOTIFICATION #3: Order Failed (no balance)
+                # ═════════════════════════════════════════
+                message = (
+                    f"❌ <b>SELL Order FAILED</b>\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Error: No BTC available to sell"
+                )
+                send_telegram_message(message)
                 return jsonify(error="No BTC available to sell"), 400
+            
+            # Execute SELL order
             status, resp = place_market_order("sell", base_size=base_size)
-
-        if status >= 300:
-            return jsonify(error="Coinbase order failed", details=resp), 400
-        return jsonify(status="order placed", action=action, details=resp), 200
+            
+            if status >= 300:
+                # ═════════════════════════════════════════
+                # NOTIFICATION #3: Order Failed
+                # ═════════════════════════════════════════
+                error_details = resp.get("error_response", {}).get("message", "Unknown error")
+                message = (
+                    f"❌ <b>SELL Order FAILED</b>\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Size: {base_size} BTC\n"
+                    f"Error: {error_details}"
+                )
+                send_telegram_message(message)
+                return jsonify(error="Coinbase order failed", details=resp), 400
+            
+            # ═════════════════════════════════════════
+            # NOTIFICATION #2: Order Successfully Closed
+            # ═════════════════════════════════════════
+            order_id = resp.get("success_response", {}).get("order_id", "N/A")
+            message = (
+                f"✅ <b>SELL Order Closed</b>\n\n"
+                f"Symbol: {symbol}\n"
+                f"Size: {base_size} BTC\n"
+                f"Order ID: {order_id}\n"
+                f"Status: Success"
+            )
+            send_telegram_message(message)
+            
+            return jsonify(status="order placed", action=action, details=resp), 200
 
     except Exception as e:
+        # ═════════════════════════════════════════
+        # NOTIFICATION #4: Unhandled Exception
+        # ═════════════════════════════════════════
         print("ERROR:", repr(e))
         print("TRACEBACK:", traceback.format_exc())
+        
+        message = (
+            f"⚠️ <b>Railway Error</b>\n\n"
+            f"Action: {action.upper()}\n"
+            f"Symbol: {symbol}\n"
+            f"Error: {str(e)[:200]}"
+        )
+        send_telegram_message(message)
+        
         return jsonify(error="Unhandled exception", details=str(e)), 500
 
 # ─────────────────────────────────────────
-# Health
+# Health check endpoint
 # ─────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
+
+# Send startup notification
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    send_telegram_message("🚀 <b>Railway Trading Bot Started</b>\n\nBot is online and ready to receive signals.")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
