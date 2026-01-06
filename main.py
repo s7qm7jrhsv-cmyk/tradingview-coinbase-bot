@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Multi-coin trading with Telegram notifications!
+# This one works with Telegram notifications AND price alerts!
 
 # ─────────────────────────────────────────
 # ENV VARIABLES (Railway / GitHub Actions)
@@ -103,9 +103,6 @@ def require_env():
     if not COINBASE_PRIVATE_KEY:
         missing.append("COINBASE_PRIVATE_KEY")
     if missing:
-        # ═════════════════════════════════════════
-        # NOTIFICATION #4: Connection/Configuration Error
-        # ═════════════════════════════════════════
         error_msg = f"⚠️ <b>Railway Configuration Error</b>\n\nMissing: {', '.join(missing)}"
         send_telegram_message(error_msg)
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
@@ -241,14 +238,53 @@ def webhook():
         else:
             return jsonify(error="Body is not valid JSON and no BUY/SELL keyword found"), 400
 
+    action = (data.get("action") or "").strip().lower()
+    
+    # ═════════════════════════════════════════
+    # NEW: HANDLE PRICE ALERTS (NO TRADING)
+    # ═════════════════════════════════════════
+    if action == "alert":
+        symbol = data.get("symbol", "Unknown").strip()
+        price = data.get("price", "N/A")
+        direction = data.get("direction", "").strip().upper()  # "ABOVE" or "BELOW"
+        threshold = data.get("threshold", "N/A")
+        
+        # Send Telegram notification
+        if direction == "ABOVE":
+            emoji = "🚀"
+            message = (
+                f"{emoji} <b>Price Alert: {symbol}</b>\n\n"
+                f"Current Price: ${price}\n"
+                f"Alert: Price went ABOVE ${threshold}\n"
+                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        elif direction == "BELOW":
+            emoji = "⚠️"
+            message = (
+                f"{emoji} <b>Price Alert: {symbol}</b>\n\n"
+                f"Current Price: ${price}\n"
+                f"Alert: Price went BELOW ${threshold}\n"
+                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        else:
+            message = (
+                f"📊 <b>Price Alert: {symbol}</b>\n\n"
+                f"Current Price: ${price}\n"
+                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        
+        send_telegram_message(message)
+        return jsonify(status="alert sent", symbol=symbol, price=price), 200
+
+    # ═════════════════════════════════════════
+    # EXISTING: HANDLE BUY/SELL TRADING
+    # ═════════════════════════════════════════
     try:
         require_env()
     except RuntimeError as e:
         print("ERROR: Env validation failed:", str(e))
         return jsonify(error=str(e)), 500
 
-    # Extract action, symbol, and amount from webhook
-    action = (data.get("action") or "").strip().lower()
     symbol = data.get("symbol", "").strip()
     usd_amount = data.get("usd_amount")
     
@@ -256,7 +292,7 @@ def webhook():
     if action not in {"buy", "sell"}:
         return jsonify(
             error="Invalid or missing 'action'",
-            hint="Webhook must include {'action':'buy'|'sell', 'symbol':'BTC-USDC', 'usd_amount':250}"
+            hint="Webhook must include {'action':'buy'|'sell'|'alert', 'symbol':'BTC-USDC', ...}"
         ), 400
     
     # Validate symbol
@@ -290,9 +326,6 @@ def webhook():
             status, resp = place_market_order(product_id, "buy", usd_amount=usd_amount)
             
             if status >= 300:
-                # ═════════════════════════════════════════
-                # NOTIFICATION #3: Order Failed
-                # ═════════════════════════════════════════
                 error_details = resp.get("error_response", {}).get("message", "Unknown error")
                 message = (
                     f"❌ <b>BUY Order FAILED</b>\n\n"
@@ -303,9 +336,6 @@ def webhook():
                 send_telegram_message(message)
                 return jsonify(error="Coinbase order failed", details=resp), 400
             
-            # ═════════════════════════════════════════
-            # NOTIFICATION #1: Order Successfully Opened
-            # ═════════════════════════════════════════
             order_id = resp.get("success_response", {}).get("order_id", "N/A")
             message = (
                 f"✅ <b>BUY Order Opened</b>\n\n"
@@ -322,9 +352,6 @@ def webhook():
             # Fetch account balance for the base currency
             status_accounts, data_accounts = fetch_accounts()
             if status_accounts >= 300:
-                # ═════════════════════════════════════════
-                # NOTIFICATION #3: Order Failed (account fetch)
-                # ═════════════════════════════════════════
                 message = (
                     f"❌ <b>SELL Order FAILED</b>\n\n"
                     f"Symbol: {product_id}\n"
@@ -344,9 +371,6 @@ def webhook():
                         break
             
             if not base_size:
-                # ═════════════════════════════════════════
-                # NOTIFICATION #3: Order Failed (no balance)
-                # ═════════════════════════════════════════
                 message = (
                     f"❌ <b>SELL Order FAILED</b>\n\n"
                     f"Symbol: {product_id}\n"
@@ -359,9 +383,6 @@ def webhook():
             status, resp = place_market_order(product_id, "sell", base_size=base_size)
             
             if status >= 300:
-                # ═════════════════════════════════════════
-                # NOTIFICATION #3: Order Failed
-                # ═════════════════════════════════════════
                 error_details = resp.get("error_response", {}).get("message", "Unknown error")
                 message = (
                     f"❌ <b>SELL Order FAILED</b>\n\n"
@@ -372,9 +393,6 @@ def webhook():
                 send_telegram_message(message)
                 return jsonify(error="Coinbase order failed", details=resp), 400
             
-            # ═════════════════════════════════════════
-            # NOTIFICATION #2: Order Successfully Closed
-            # ═════════════════════════════════════════
             order_id = resp.get("success_response", {}).get("order_id", "N/A")
             message = (
                 f"✅ <b>SELL Order Closed</b>\n\n"
@@ -388,9 +406,6 @@ def webhook():
             return jsonify(status="order placed", action=action, product_id=product_id, details=resp), 200
 
     except Exception as e:
-        # ═════════════════════════════════════════
-        # NOTIFICATION #4: Unhandled Exception
-        # ═════════════════════════════════════════
         print("ERROR:", repr(e))
         print("TRACEBACK:", traceback.format_exc())
         
@@ -413,7 +428,7 @@ def health():
 
 # Send startup notification
 if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-    send_telegram_message("🚀 <b>Railway Trading Bot Started</b>\n\nBot is online and ready to receive signals for any coin.")
+    send_telegram_message("🚀 <b>Railway Trading Bot Started</b>\n\nBot is online and ready to receive signals and price alerts.")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
