@@ -222,13 +222,17 @@ def get_base_currency(product_id: str) -> str:
 @app.route("/webhook", methods=["POST"])
 def webhook():
     raw_body = request.data.decode("utf-8", errors="ignore")
+    print("=" * 80)
     print("RAW WEBHOOK BODY:", raw_body)
+    print("=" * 80)
 
     # Parse JSON or fallback plain text
     data = None
     try:
         data = json.loads(raw_body)
-    except Exception:
+        print("PARSED JSON DATA:", json.dumps(data, indent=2))
+    except Exception as parse_error:
+        print("JSON PARSE ERROR:", repr(parse_error))
         text = raw_body.strip()
         upper = text.upper()
         if upper.startswith("BUY"):
@@ -236,18 +240,23 @@ def webhook():
         elif upper.startswith("SELL"):
             data = {"action": "sell"}
         else:
-            return jsonify(error="Body is not valid JSON and no BUY/SELL keyword found"), 400
+            print(f"ERROR: Could not parse body. Not JSON and doesn't start with BUY/SELL")
+            return jsonify(error="Body is not valid JSON and no BUY/SELL keyword found", received=raw_body[:200]), 400
 
     action = (data.get("action") or "").strip().lower()
+    print(f"ACTION EXTRACTED: '{action}'")
     
     # ═════════════════════════════════════════
     # NEW: HANDLE PRICE ALERTS (NO TRADING)
     # ═════════════════════════════════════════
     if action == "alert":
+        print("Processing ALERT action...")
         symbol = data.get("symbol", "Unknown").strip()
         price = data.get("price", "N/A")
         direction = data.get("direction", "").strip().upper()  # "ABOVE" or "BELOW"
         threshold = data.get("threshold", "N/A")
+        
+        print(f"Alert details: symbol={symbol}, price={price}, direction={direction}, threshold={threshold}")
         
         # Send Telegram notification
         if direction == "ABOVE":
